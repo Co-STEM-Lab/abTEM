@@ -40,6 +40,273 @@ def crystal_slice_thicknesses(atoms: Atoms, tolerance: float = 0.2) -> np.ndarra
     return slice_thickness
 
 
+def commensurate_slice_thickness(
+    atoms: Atoms,
+    target_thickness: float = 1.0,
+    tolerance: float = 0.2,
+) -> tuple[float, ...]:
+    """
+    Find slice thicknesses commensurate with the crystal planes, closest to a target
+    thickness.
+
+    Unique z-positions (within `tolerance`) define candidate slice boundaries between 0
+    and the cell height.  Adjacent plane-level slices are merged so that each resulting
+    slice thickness is as close as possible to `target_thickness` while keeping
+    boundaries aligned with atomic planes.
+
+    Parameters
+    ----------
+    atoms : Atoms
+        The atoms to be sliced. Must have an orthogonal cell.
+    target_thickness : float
+        Target slice thickness [Å].
+    tolerance : float
+        Tolerance for identifying distinct crystal planes [Å].
+
+    Returns
+    -------
+    tuple of float
+        Commensurate slice thicknesses.
+    """
+    cell_z = float(atoms.cell[2, 2])
+    z = atoms.positions[:, 2] % cell_z
+
+    # Snap values at z ≈ cell_z back to 0 before deduplicating, so planes near
+    # the periodic boundary merge with planes near 0 instead of being treated
+    # as distinct. Identify unique planes by sorted-neighbor distance (as in
+    # commensurate_gpts) rather than rounding to a fixed tolerance-wide grid
+    # anchored at 0: fixed-grid rounding can split two atoms much closer
+    # together than `tolerance` into different bins when they straddle a bin
+    # edge, or merge genuinely distinct planes that land in the same bin.
+    z[z > cell_z - tolerance] = 0.0
+    z = np.sort(z)
+    unique_mask = np.concatenate([[True], np.diff(z) > tolerance])
+    unique_z = z[unique_mask]
+    unique_z = unique_z[(unique_z > tolerance / 2) & (unique_z < cell_z - tolerance / 2)]
+
+    boundaries = np.sort(np.concatenate(([0.0], unique_z, [cell_z])))
+    plane_thicknesses = np.diff(boundaries)
+
+    merged = []
+    acc = 0.0
+    for t in plane_thicknesses:
+        if acc > 0 and acc + t > target_thickness and acc >= target_thickness * 0.5:
+            merged.append(acc)
+            acc = t
+        else:
+            acc += t
+    if acc > 0:
+        # z is periodic, so the last slice and the first slice are also
+        # adjacent through the wrap at cell_z ≡ 0. Without this, a trailing
+        # remainder that is real (spacing ≥ tolerance) but well below half
+        # the target thickness would end up as its own near-degenerate final
+        # slice, since nothing follows it to trigger the merge guard above.
+        if merged and acc < target_thickness * 0.5:
+            merged[-1] += acc
+        else:
+            merged.append(acc)
+
+    result = tuple(float(t) for t in merged)
+    assert np.isclose(sum(result), cell_z)
+    return result
+
+
+def commensurate_gpts(
+    extent: tuple[float, float],
+    positions: np.ndarray,
+    target_sampling: float = 0.05,
+    tolerance: float = 1e-3,
+    round_to_fast_fft: bool = True,
+) -> tuple[int, int]:
+    """
+    Find grid points such that the sampling grid is commensurate with the atom
+    positions in x and y, closest to a target sampling.
+
+    For each axis the function identifies the unique atom planes and computes the
+    GCD of the spacings between them.  This gives the primitive lattice spacing
+    and therefore the required grid period p (= number of grid points per unit
+    cell of the primitive lattice).  The result is invariant under rigid
+    translations of the structure: a crystal that has been centered or otherwise
+    shifted within the cell always yields the same p as the unshifted version.
+
+    When `round_to_fast_fft` is enabled the number of grid points additionally
+    factorizes completely into the primes 2, 3, 5 and 7 whenever that is
+    compatible with commensurability, so FFTs run on fast radix kernels instead
+    of the slow, memory-hungry Bluestein fallback.  The smallest such grid not
+    coarser than the target sampling is chosen; if the grid period p itself
+    contains a prime factor larger than 7 no multiple of it can be a fast FFT
+    length, and commensurability takes precedence.
+
+    Parameters
+    ----------
+    extent : tuple of float
+        Grid extent in x and y [Å].
+    positions : np.ndarray
+        Atom positions with shape (N, 3) or (N, 2).
+    target_sampling : float
+        Target grid sampling [Å].
+    tolerance : float
+        Tolerance for identifying distinct atom planes [Å].
+    round_to_fast_fft : bool
+        If True (default), prefer grids that are also fast FFT sizes (all prime
+        factors in {2, 3, 5, 7}), at the cost of a sampling slightly finer than
+        commensurability alone would give.
+
+    Returns
+    -------
+    tuple of int
+        Number of grid points in x and y.
+    """
+    from abtem.core.fft import is_fast_fft_size, next_fast_fft_size
+
+    def plane_set_invariant_under(unique_x: np.ndarray, L: float, s: float) -> bool:
+        # Every plane, shifted by s, must land within tolerance of a plane.
+        shifted = np.sort((unique_x + s) % L)
+        idx = np.searchsorted(unique_x, shifted)
+        neighbors = np.stack(
+            [
+                unique_x[np.clip(idx - 1, 0, len(unique_x) - 1)],
+                unique_x[np.clip(idx, 0, len(unique_x) - 1)],
+            ]
+        )
+        distances = np.abs(neighbors - shifted)
+        distances = np.minimum(distances, L - distances)
+        return bool(np.all(distances.min(axis=0) < tolerance))
+
+    def translational_period_count(unique_x: np.ndarray, L: float) -> int:
+        # Largest m such that the set of atom planes is invariant under a shift
+        # of L / m. Even when the intra-cell plane positions are irrational
+        # (no commensurate grid exists), a repeated unit cell still imposes
+        # this translational period, and symmetry-equivalent atoms only see
+        # identical discretised potentials if gpts is a multiple of m.
+        #
+        # A shift s mapping the plane set onto itself must map the first plane
+        # onto some plane, so the only candidates are the differences to the
+        # first plane -- and s must moreover be L / m for near-integer m.
+        # Testing candidates in increasing s, the first valid shift is the
+        # minimal period, i.e. the largest m. This prunes the search from
+        # every m in [2, n_planes] to the few difference-derived candidates,
+        # typically O(n log n) overall instead of O(n^2 log n).
+        deltas = np.sort((unique_x - unique_x[0]) % L)
+        candidates_tried = 0
+        for s in deltas:
+            if s < tolerance or s > L / 2 + tolerance:
+                # m = L / s must be >= 2; deltas are sorted, so we could stop
+                # at the first s beyond L / 2, but the loop is cheap enough.
+                continue
+            m = L / s
+            m_int = int(round(m))
+            if m_int < 2 or abs(m - m_int) > 0.05:
+                continue
+            candidates_tried += 1
+            if candidates_tried > 64:
+                # Pathological sets can offer many near-integer-ratio
+                # differences that all fail the invariance test; treat such a
+                # structure as period-free rather than going quadratic.
+                return 1
+            if plane_set_invariant_under(unique_x, L, s):
+                return m_int
+        return 1
+
+    def fallback_gpts(n_target: int, unique_x=None, L=None) -> int:
+        # The GCD search found no commensurate period. When fast-FFT rounding
+        # is enabled, pick the fast size that (a) keeps gpts a multiple of the
+        # translational period count m of the plane set and (b) best aligns
+        # the planes with grid points: structures with an irrational internal
+        # parameter (e.g. rutile u = 0.306, brookite) have no exactly
+        # commensurate grid, but some fast sizes come much closer than others.
+        if not round_to_fast_fft:
+            return n_target
+        if unique_x is None or L is None or len(unique_x) <= 1:
+            return next_fast_fft_size(n_target)
+
+        m = translational_period_count(unique_x, L)
+        if not is_fast_fft_size(m):
+            # No multiple of m can be a fast FFT size; translational
+            # commensurability takes precedence, as in the main path.
+            return max(round(n_target / m), 1) * m
+
+        best = None
+        multiplier = -(-n_target // m)
+        while True:
+            multiplier = next_fast_fft_size(multiplier)
+            n = multiplier * m
+            # Score by ALIGNABILITY, not realized alignment: the smallest
+            # achievable max plane-to-gridpoint distance over all grid-origin
+            # phases. The plane residues x_i*n/L mod 1 must cluster near a
+            # common phase for the planes to sit near grid points; the tightest
+            # arc containing all residues is 1 - (largest circular gap), and
+            # centering the phase in that arc gives max distance (1 - gap)/2.
+            # Unlike distance-to-nearest-gridpoint at a fixed origin, this
+            # depends only on RELATIVE positions, so a rigidly translated
+            # structure gets the same grid (a tested invariant of the
+            # commensurate search that the fallback must preserve).
+            residues = np.sort(np.mod(unique_x * (n / L), 1.0))
+            gaps = np.diff(np.concatenate([residues, [residues[0] + 1.0]]))
+            alignability = (1.0 - float(np.max(gaps))) / 2.0
+            # Round the score so nearly-equal alignments prefer the smaller grid.
+            score = (round(alignability, 2), n)
+            if best is None or score < best[0]:
+                best = (score, n)
+            if n > n_target * 1.12:
+                return best[1]
+            multiplier += 1
+
+    gpts = []
+    for i in range(2):
+        L = extent[i]
+        n_target = int(np.ceil(L / target_sampling))
+
+        x = positions[:, i] % L
+        # Snap values at x ≈ L back to 0: floating-point modulo can leave atoms
+        # from cell-transform at L−ε rather than 0, creating a spurious near-zero
+        # spacing that breaks the GCD calculation.
+        x[x > L - tolerance] = 0.0
+        x = np.sort(x)
+
+        # De-duplicate: keep one representative per distinct atom plane
+        unique_mask = np.concatenate([[True], np.diff(x) > tolerance])
+        unique_x = x[unique_mask]
+
+        if len(unique_x) <= 1:
+            gpts.append(fallback_gpts(n_target, unique_x, L))
+            continue
+
+        # Spacings between consecutive unique planes, including the wrap-around gap
+        spacings = np.concatenate([np.diff(unique_x), [L + unique_x[0] - unique_x[-1]]])
+
+        min_spacing = float(np.min(spacings))
+        if min_spacing < tolerance:
+            gpts.append(fallback_gpts(n_target, unique_x, L))
+            continue
+
+        # Check that every spacing is approximately an integer multiple of the
+        # minimum spacing (i.e. the minimum is the primitive spacing).
+        ratios = spacings / min_spacing
+        k = np.round(ratios).astype(int)
+        if np.any(np.abs(ratios - k) > 0.05) or np.any(k < 1):
+            # No clear commensurability — fall back to the raw target
+            gpts.append(fallback_gpts(n_target, unique_x, L))
+            continue
+
+        # Primitive spacing refined as L / (total number of primitive periods).
+        # Using L / sum(k) is more accurate than min_spacing alone because it
+        # averages out any floating-point scatter in the individual spacings.
+        n_periods = int(np.sum(k))
+        if round_to_fast_fft and is_fast_fft_size(n_periods):
+            # A multiple m * n_periods is a fast FFT size exactly when both
+            # factors are, so the smallest fast commensurate grid not coarser
+            # than the target uses the next fast multiplier. When n_periods
+            # itself has a prime factor larger than 7, no multiple can be fast
+            # and commensurability takes precedence (handled below).
+            n_multiple = next_fast_fft_size(-(-n_target // n_periods)) * n_periods
+        else:
+            n_multiple = max(round(n_target / n_periods), 1) * n_periods
+        gpts.append(n_multiple)
+
+    return tuple(gpts)
+
+
 def is_number(value: Any) -> TypeGuard[int | float | np.ndarray]:
     """
     Check if the value is a number, including a NumPy array with a single element,

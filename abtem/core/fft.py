@@ -1,5 +1,6 @@
 """Module for handling Fourier transforms and convolution in *ab*TEM."""
 
+import threading
 import warnings
 from itertools import product as _product
 from typing import Tuple, TypeVar, overload
@@ -37,6 +38,13 @@ except ImportError:
     cp = None
 
 
+# Deliberately NOT scipy.fft.next_fast_len's set: scipy targets pocketfft,
+# whose kernels go up to radix 11, so next_fast_len returns 11-smooth lengths
+# (next_fast_len(121) == 121 == 11**2). cuFFT documents optimized kernels only
+# for sizes of the form 2^a * 3^b * 5^c * 7^d, so a factor-11 length falls off
+# exactly the GPU fast path this module exists to protect. {2, 3, 5, 7} is the
+# intersection guaranteed fast on every backend abTEM uses (FFTW, pocketfft,
+# MKL, cuFFT, hipFFT).
 _FAST_FFT_PRIMES = (2, 3, 5, 7)
 
 
@@ -75,7 +83,9 @@ def next_fast_fft_size(n: int) -> int:
     The smallest length >= ``n`` whose prime factors are all in {2, 3, 5, 7}.
 
     Useful for choosing grid sizes (``gpts``) that avoid the slow
-    large-workspace Bluestein fallback on GPU.
+    large-workspace Bluestein fallback on GPU. Stricter than
+    ``scipy.fft.next_fast_len``, which returns 11-smooth lengths (fast for
+    pocketfft on CPU, but off cuFFT's documented fast path).
 
     Parameters
     ----------
@@ -94,6 +104,9 @@ def next_fast_fft_size(n: int) -> int:
 
 
 _warned_slow_fft_shapes: set = set()
+# _fft_dispatch runs concurrently in dask worker threads, so the check-then-add
+# on the shape set must be atomic or the same shape can warn more than once.
+_warned_slow_fft_shapes_lock = threading.Lock()
 
 # Bluestein overhead only matters for large transforms; small odd-sized arrays
 # (e.g. interpolated measurements) are not worth a warning.
@@ -103,9 +116,12 @@ _SLOW_FFT_WARN_MIN_ELEMENTS = 1024 * 1024
 def _warn_slow_fft_size(shape):
     """Warn once per large 2D transform shape whose lengths force Bluestein."""
     dims = tuple(int(n) for n in shape[-2:])
-    if len(dims) < 2 or dims in _warned_slow_fft_shapes:
+    if len(dims) < 2:
         return
-    _warned_slow_fft_shapes.add(dims)
+    with _warned_slow_fft_shapes_lock:
+        if dims in _warned_slow_fft_shapes:
+            return
+        _warned_slow_fft_shapes.add(dims)
     if dims[0] * dims[1] < _SLOW_FFT_WARN_MIN_ELEMENTS:
         return
     if all(is_fast_fft_size(n) for n in dims):
