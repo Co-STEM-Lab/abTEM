@@ -77,8 +77,12 @@ def test_filtering_does_not_scale_with_the_number_of_chunks(setup):
 
 
 def test_results_are_independent_of_the_chunk_size(setup):
-    """The threshold is per site, so chunking cannot change the outcome."""
+    """The threshold is per site, so chunking cannot change which sites
+    contribute -- only the order in which their contributions are summed,
+    which at the configured precision is a round-off level difference.
+    """
     coarse = _run(setup, scatter_max_batch=64)
     fine = _run(setup, scatter_max_batch=1)
 
-    assert np.allclose(coarse, fine, rtol=1e-10, atol=0)
+    tolerance = 1e-5 if coarse.dtype == np.float32 else 1e-10
+    assert np.allclose(coarse, fine, rtol=tolerance, atol=0)
