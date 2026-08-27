@@ -234,6 +234,7 @@ def test_warn_slow_fft_size_thread_safe():
     assert len(calls) == 1
 
 
+
 def test_plan_cache_entry_limit_is_raised():
     cp = pytest.importorskip("cupy")
     try:

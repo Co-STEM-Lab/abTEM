@@ -1,0 +1,60 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/docker-existing-dockerfile
+{
+    "name": "Dev Ubuntu 24.04 ROCm 7.0",
+
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+
+    "workspaceFolder": "/workspace",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+
+    "postCreateCommand": "uv pip install --no-cache-dir -e . && uv pip install --no-cache-dir xarray jupyterlab",
+    "postStartCommand": "nohup bash -c 'jupyter notebook --ip=0.0.0.0 --port=8888 --allow-root --NotebookApp.token='' --no-browser > nohup.out &'",
+
+    "forwardPorts": [
+        8888
+    ],
+
+    // Configure tool-specific properties.
+    "customizations": {
+        // Configure propertie s specific to VS Code.
+        "vscode": {
+            "settings": {
+                "terminal.integrated.cwd": "/workspace"
+            },
+            // Add the IDs of extensions you want installed when the container is created.
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "anthropic.claude-code",
+                "ms-python.pylint",
+                "eamodio.gitlens",
+                "usernamehw.errorlens",
+                "ms-azuretools.vscode-docker"
+            ]
+        }
+    },
+
+    "runArgs": [
+	"--cap-add=SYS_PTRACE",
+        "--security-opt",
+        "seccomp=unconfined",
+        "--device=/dev/kfd",
+        "--device=/dev/dri",
+        "--group-add=video",
+        "--ipc=host",
+        "--shm-size",
+        "8G"
+    ],
+
+    "containerEnv": {
+        "GPAW_NEW": "0",
+        "GPAW_USE_GPUS": "0",
+        "CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN}",
+        "ANTHROPIC_OAUTH_TOKEN": "${localEnv:ANTHROPIC_OAUTH_TOKEN}",
+        "CLAUDE_CONFIG_DIR": "/workspace/.claude"
+    }
+
+}
