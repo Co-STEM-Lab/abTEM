@@ -221,11 +221,21 @@ def _configure_cufft_cache():
         limit = int(raw)
 
     cache = cp.fft.config.get_plan_cache()
+    entries = int(config.get("cupy.fft-cache-entries", 64))
     if limit == 0:
         cache.set_size(0)       # disable caching entirely
-    elif limit > 0:
-        cache.set_memsize(limit)
-    # limit < 0 → leave at CuPy default (unlimited)
+    else:
+        # CuPy keeps at most 16 plans. Workloads whose batch dimension varies
+        # pass that within a few chunks and then rebuild plans continuously:
+        # profiling a core-loss scan, whose scattering batches follow the
+        # number of sites passing the threshold, put 30 % of the runtime in
+        # _get_cufft_plan_nd, and raising the limit made the same scan 18 %
+        # faster with identical results.
+        if cache.get_size() != entries:
+            cache.set_size(entries)
+        if limit > 0:
+            cache.set_memsize(limit)
+        # limit < 0 → leave the workspace unbounded (CuPy default)
 
     _CUFFT_CACHE_STATE = (raw, limit)
 
