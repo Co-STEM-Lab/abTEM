@@ -191,6 +191,49 @@ def _laplace_stencil_array(accuracy):
     return stencil
 
 
+# 融合 CUDA 核：单次发射计算可分离 2D 拉普拉斯（等价于逐次切片累加的模板）。
+# 每个线程一次读出、累加全部抽头并写回一次，把全数组访存从 ~k 次降到 1 次，
+# 大幅降低内存带宽开销。复数按内存布局 (real,imag) 连续存放，核内按 2*idx 取实/虚，
+# 因此无需 CUDA complex 头文件。@SCALAR@ 在编译时替换为 float（complex64）或 double（complex128）。
+_LA_PLACE_KERNEL_TEMPLATE = r'''
+
+extern "C" __global__ void laplace(
+    const @SCALAR@* a, @SCALAR@* out, const @SCALAR@* c,
+    int n, int M, int H, int W) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  long total = (long)M * H * W;
+  if (idx >= total) return;
+  int m = idx / ((long)H * W);
+  int rem = idx % ((long)H * W);
+  int i = rem / W, j = rem % W;
+  if (i < n || i >= H - n || j < n || j >= W - n) { out[2 * idx] = 0; out[2 * idx + 1] = 0; return; }
+  @SCALAR@ ar = 0, ai = 0;
+  long base = (long)m * H * W;
+  for (int k = -n; k <= n; k++) {
+    @SCALAR@ ck = c[k + n];
+    long q0 = (base + (long)(i + k) * W + j) * 2;
+    long q1 = (base + (long)i * W + (j + k)) * 2;
+    ar += ck * (a[q0] + a[q1]);
+    ai += ck * (a[q0 + 1] + a[q1 + 1]);
+  }
+  out[2 * idx] = ar;
+  out[2 * idx + 1] = ai;
+}
+'''
+
+_laplace_gpu_kernels = {}
+
+
+def _get_laplace_gpu_kernel(scalar):
+    """按标量精度（'float' 或 'double'）缓存融合 Laplacian CUDA 核。"""
+    if scalar not in _laplace_gpu_kernels:
+        import cupy
+
+        src = _LA_PLACE_KERNEL_TEMPLATE.replace("@SCALAR@", scalar)
+        _laplace_gpu_kernels[scalar] = cupy.RawKernel(src, "laplace")
+    return _laplace_gpu_kernels[scalar]
+
+
 def _laplace_operator_stencil(
     accuracy, prefactor, mode: str = "wrap", dtype=None, device: str = "cpu"
 ):
@@ -219,36 +262,28 @@ def _laplace_operator_stencil(
                     out[m, i, j] = cumul
         return out
 
-    @cuda.jit
-    def stencil_func_gpu_batch(a, out):
-        m, i, j = cuda.grid(3)
-        M, H, W = a.shape
-        if m < M and n <= i < H - n and n <= j < W - n:
-            cumul = dtype(0.0)
-            for k in range(-n, n + 1):
-                cumul += c[k] * a[m, i + k, j] + c[k] * a[m, i, j + k]
-            out[m, i, j] = cumul
-
     def _laplace_stencil_gpu(a):
+        # 背散射(实空间 multislice)用 GPU 计算 Laplacian 模板。
+        # 原实现调用 numba-CUDA 核 stencil_func_gpu_batch，需要 CUDA toolkit 的
+        # libNVVM；而 numba 0.67 只支持 CUDA <= 12.4，与本机 CUDA 13 驱动不兼容，
+        # 导致 GPU 背散射直接报 "Could not find module 'nvvm.dll'"。
+        # 此前的折衷是 cupy 逐次整阵切片累加（内存带宽受限）。
+        # 现改为单次发射的融合 CUDA 核（每线程一次读写、抽头命中缓存），进一步提速，
+        # 且同样绕开 numba-CUDA 编译。
         xp = get_array_module(a)
-        out = xp.zeros_like(a)
-
         M, H, W = a.shape
+        scalar = "float" if np.dtype(a.dtype) == np.complex64 else "double"
 
-        threads_x = 8
-        threads_y = 8
+        # 以 0 为中心偏移的实数系数：offset k -> coefs[k+n]（c 为 np.roll 后的排列）
+        coef_dtype = np.float32 if scalar == "float" else np.float64
+        coefs = np.array([complex(c[kk]).real for kk in range(-n, n + 1)], dtype=coef_dtype)
+        coefs = xp.asarray(coefs)
 
-        target_threads = 256
-        threads_m = max(1, target_threads // (threads_x * threads_y))
-
-        threadsperblock = (threads_m, threads_x, threads_y)
-
-        blockspergrid_m = math.ceil(a.shape[0] / threadsperblock[0])
-        blockspergrid_x = math.ceil(a.shape[1] / threadsperblock[1])
-        blockspergrid_y = math.ceil(a.shape[2] / threadsperblock[2])
-        blockspergrid = (blockspergrid_m, blockspergrid_x, blockspergrid_y)
-        stencil_func_gpu_batch[blockspergrid, threadsperblock](a, out)
-
+        out = xp.empty_like(a)
+        kernel = _get_laplace_gpu_kernel(scalar)
+        block = 256
+        grid = ((M * H * W + block - 1) // block,)
+        kernel(grid, (block,), (a, out, coefs, n, M, H, W))
         return out
 
     def _laplace_stencil(a):
@@ -310,22 +345,57 @@ def _laplace_operator_func_slow(accuracy, prefactor):
     return func
 
 
+def _fft_laplace_stencil(sampling, device: str = "cpu"):
+    """傅里叶空间谱解析拉普拉斯模板：∇² -> -(2πk)²（周期性，无截断误差）。
+
+    作用于 (M,H,W) 复数数组 a：fft2 -> 乘 -k² -> ifft2。k = fftfreq(N, d=sampling)
+    （cycles/Å，与 FD 模板的 mode="wrap" 周期性一致，且是谱精确解）。对 cupy/numpy
+    数组均可用（get_array_module 自动切换 FFT 后端）；与有限差分模板相比，
+    高频处无修改波数偏差，因此更适合作为背散射/实空间多切片的基准或高精度选项。
+    """
+    sampling = np.asarray(sampling, dtype=float)
+    dx, dy = float(sampling[0]), float(sampling[1])
+
+    def stencil(a):
+        xp = get_array_module(a)
+        fft = xp.fft
+        H, W = a.shape[-2:]
+        kx = fft.fftfreq(W, d=dx)
+        ky = fft.fftfreq(H, d=dy)
+        # k2 为 (H,W) 二维；与 fft2(a) 相乘时按 numpy 广播规则匹配前导批次维
+        #（a 形状可为 (H,W) 或 (M,H,W)），避免添加显式批量维导致形状不匹配。
+        k2 = (2 * np.pi * kx)[None, :] ** 2 + (2 * np.pi * ky)[:, None] ** 2
+        return fft.ifft2(-k2 * fft.fft2(a))
+
+    return stencil
+
+
 class LaplaceOperator:
-    def __init__(self, accuracy):
+    def __init__(self, accuracy, method: str = "finite_difference"):
         """
-        Centered finite-difference laplacian operator.
+        Laplace operator used in the real-space multislice.
 
         Parameters
         ----------
-        accuracy: int
-            centered finite-difference stencil accuracy
+        accuracy : int
+            centered finite-difference stencil accuracy (ignored when method="fft")
+        method : str, optional
+            "finite_difference" (default) uses the centered finite-difference stencil;
+            "fft" evaluates the Laplacian in Fourier space (spectrally exact, no
+            truncation error).
         """
         self._accuracy = accuracy
         self._key = None
         self._stencil = None
 
+        if method not in ("finite_difference", "fft"):
+            raise ValueError(f"Unsupported laplace method: {method}")
+        self._method = method
+
     def _get_new_stencil(self, key, device: str = "cpu"):
         wavelength, sampling = key
+        if self._method == "fft":
+            return _fft_laplace_stencil(sampling, device=device)
         prefactor = 1 / np.prod(np.array(sampling, dtype=float))
         return _laplace_operator_stencil(
             self._accuracy, prefactor, mode="wrap",

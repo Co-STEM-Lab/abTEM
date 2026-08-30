@@ -592,12 +592,17 @@ class RealSpaceMultislice:
         Finite-difference accuracy for Laplace operator (default 6)
     max_terms: int, optional
         Max terms in exponent Taylor series expansion (default 80)
+    laplace_method : str, optional
+        How the Laplacian operator is evaluated:
+          * "finite_difference" (default): centered finite-difference stencil
+          * "fft": in Fourier space (fft2 -> -k^2 -> ifft2), spectrally exact
     """
 
     order: int = 1
     expansion_scope: Literal["propagator", "full"] = "propagator"
     derivative_accuracy: int = 6
     max_terms: int = 80
+    laplace_method: Literal["finite_difference", "fft"] = "finite_difference"
 
 
 def multislice_and_detect(
@@ -689,7 +694,9 @@ def multislice_and_detect(
             )
 
     else:
-        laplace_operator = LaplaceOperator(algorithm.derivative_accuracy)
+        laplace_operator = LaplaceOperator(
+            algorithm.derivative_accuracy, method=algorithm.laplace_method
+        )
 
         def multislice_step(waves, potential_slice, next_slice=None):
             return realspace_multislice_step(
@@ -962,7 +969,9 @@ def transition_potential_multislice_and_detect(
             )
 
     else:
-        laplace_operator = LaplaceOperator(algorithm.derivative_accuracy)
+        laplace_operator = LaplaceOperator(
+            algorithm.derivative_accuracy, method=algorithm.laplace_method
+        )
 
         def multislice_step(waves, potential_slice):
             return realspace_multislice_step(
