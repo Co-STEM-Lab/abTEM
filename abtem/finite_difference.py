@@ -461,6 +461,16 @@ def _multislice_exponential_series(
     xp = get_array_module(waves)
     initial_amplitude = xp.abs(waves).sum()
 
+    # A zero-amplitude wave needs no exponential-series expansion: every term is
+    # zero, so the loop would only hit the relative-tolerance check
+    # (temp_amplitude / initial_amplitude <= tolerance) with a division by zero.
+    # That yields inf on the left-hand side and the series never breaks, so it
+    # exhausts `max_terms` and raises NotConvergedError. Such a wave appears e.g.
+    # when back-propagating backscattered waves that are exactly zero at deep
+    # exit planes. Early-return the untouched zero wave.
+    if initial_amplitude == 0:
+        return waves
+
     if fully_corrected:
         temp = full_series(
             waves, laplace, transmission_function, order, wavelength, thickness

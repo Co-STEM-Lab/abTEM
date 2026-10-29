@@ -877,25 +877,50 @@ def _back_propagate_backscattered_waves(
         for slice in config.generate_slices()
     ]
 
-    effective_slices = _aggregate_slices_by_exit_planes(
-        potential_slices, potential.exit_planes
-    )
+    exit_planes = potential.exit_planes
 
-    num_slices = len(effective_slices)
-    if len(backscattered_waves) != num_slices + 1:
+    # The backscattered waves are stored with shape (..., n_exit_planes, ny, nx):
+    # the "exit plane" axis is the LAST ensemble axis, i.e. it sits at position -3
+    # (the two trailing axes are the real-space grid ny, nx). In front of it there may
+    # be additional ensemble axes (e.g. a frozen-phonon / scan axis that is size 1).
+    # Using len(backscattered_waves) would count the FIRST axis (e.g. 1 for a size-1
+    # phonon axis), not the exit-plane axis, causing "Wrong shapes". Instead read the
+    # exit-plane size directly from the array and index that axis with a tuple of
+    # (0,)*n_ensemble_axes followed by the exit-plane index.
+    n_ensemble_axes = backscattered_waves.array.ndim - 3
+
+    def exit_plane_index(k: int) -> tuple[int, ...]:
+        return (0,) * n_ensemble_axes + (k,)
+
+    # Number of exit planes must equal (number of aggregated blocks) + 1.
+    num_exit_planes = backscattered_waves.array.shape[-3]
+    num_blocks = len(exit_planes) - 1
+    if num_exit_planes != num_blocks + 1:
         raise ValueError("Wrong shapes")
 
-    # zero intensity in incoming wave
-    backscattered_waves[0]._array[:] = 0
+    # zero intensity in incoming wave (entrance / first exit plane)
+    backscattered_waves[exit_plane_index(0)]._array[:] = 0
 
-    # Go through potential in reverse
-    for i in range(num_slices - 2, -1, -1):
-        contribution_at_slice = backscattered_waves[i + 1].copy()
+    # Go through potential in reverse. Instead of aggregating slices between exit
+    # planes into thick "effective" slices (which can cause the reverse exponential
+    # series to diverge for thick gaps, DivergedError), propagate the thin slices
+    # one-by-one in reverse, matching the forward propagation.
+    # For exit-plane block b (the gap after exit plane b), the thin slices are
+    # potential_slices[exit_planes[b] + 1 : exit_planes[b + 1] + 1], walked backwards.
+    for b in range(num_blocks - 1, -1, -1):
+        contribution_at_slice = backscattered_waves[exit_plane_index(b + 1)].copy()
         contribution_at_slice.array = xp.conj(contribution_at_slice.array)
-        contribution_at_slice, _ = multislice_step(
-            contribution_at_slice, effective_slices[i + 1], next_slice=None
+
+        slice_start = exit_planes[b] + 1
+        slice_end = exit_planes[b + 1] + 1
+        for slice in reversed(potential_slices[slice_start:slice_end]):
+            contribution_at_slice, _ = multislice_step(
+                contribution_at_slice, slice, next_slice=None
+            )
+
+        backscattered_waves[exit_plane_index(b)].array += xp.conj(
+            contribution_at_slice.array
         )
-        backscattered_waves[i].array += xp.conj(contribution_at_slice.array)
 
     return backscattered_waves
 
